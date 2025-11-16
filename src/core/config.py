@@ -1,13 +1,15 @@
 """Configuration management"""
 import tomli
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 class Config:
     """Application configuration"""
-    
+
     def __init__(self):
         self._config = self._load_config()
+        self._admin_username: Optional[str] = None
+        self._admin_password: Optional[str] = None
     
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from setting.toml"""
@@ -25,11 +27,19 @@ class Config:
     
     @property
     def admin_username(self) -> str:
+        # If admin_username is set from database, use it; otherwise fall back to config file
+        if self._admin_username is not None:
+            return self._admin_username
         return self._config["global"]["admin_username"]
 
     @admin_username.setter
     def admin_username(self, value: str):
+        self._admin_username = value
         self._config["global"]["admin_username"] = value
+
+    def set_admin_username_from_db(self, username: str):
+        """Set admin username from database"""
+        self._admin_username = username
 
     @property
     def sora_base_url(self) -> str:
@@ -86,11 +96,19 @@ class Config:
 
     @property
     def admin_password(self) -> str:
+        # If admin_password is set from database, use it; otherwise fall back to config file
+        if self._admin_password is not None:
+            return self._admin_password
         return self._config["global"]["admin_password"]
 
     @admin_password.setter
     def admin_password(self, value: str):
+        self._admin_password = value
         self._config["global"]["admin_password"] = value
+
+    def set_admin_password_from_db(self, password: str):
+        """Set admin password from database"""
+        self._admin_password = password
 
     def set_debug_enabled(self, enabled: bool):
         """Set debug mode enabled/disabled"""

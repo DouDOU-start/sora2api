@@ -71,24 +71,50 @@ class RequestLog(BaseModel):
 class AdminConfig(BaseModel):
     """Admin configuration"""
     id: int = 1
+    admin_username: str  # Read from database, initialized from setting.toml on first startup
+    admin_password: str  # Read from database, initialized from setting.toml on first startup
     error_ban_threshold: int = 3
     updated_at: Optional[datetime] = None
 
 class ProxyConfig(BaseModel):
     """Proxy configuration"""
     id: int = 1
-    proxy_enabled: bool = False
-    proxy_url: Optional[str] = None
+    proxy_enabled: bool  # Read from database, initialized from setting.toml on first startup
+    proxy_url: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
 class WatermarkFreeConfig(BaseModel):
     """Watermark-free mode configuration"""
     id: int = 1
-    watermark_free_enabled: bool = False
-    parse_method: str = "third_party"  # "third_party" or "custom"
-    custom_parse_url: Optional[str] = None  # Custom parse server URL
-    custom_parse_token: Optional[str] = None  # Custom parse server access token
+    watermark_free_enabled: bool  # Read from database, initialized from setting.toml on first startup
+    parse_method: str  # Read from database, initialized from setting.toml on first startup
+    custom_parse_url: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
+    custom_parse_token: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class CacheConfig(BaseModel):
+    """Cache configuration"""
+    id: int = 1
+    cache_enabled: bool  # Read from database, initialized from setting.toml on first startup
+    cache_timeout: int  # Read from database, initialized from setting.toml on first startup
+    cache_base_url: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class GenerationConfig(BaseModel):
+    """Generation timeout configuration"""
+    id: int = 1
+    image_timeout: int  # Read from database, initialized from setting.toml on first startup
+    video_timeout: int  # Read from database, initialized from setting.toml on first startup
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class TokenRefreshConfig(BaseModel):
+    """Token refresh configuration"""
+    id: int = 1
+    at_auto_refresh_enabled: bool  # Read from database, initialized from setting.toml on first startup
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

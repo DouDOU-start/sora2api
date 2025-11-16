@@ -88,6 +88,9 @@ async def manage_page():
 @app.on_event("startup")
 async def startup_event():
     """Initialize database on startup"""
+    # Get config from setting.toml
+    config_dict = config.get_raw_config()
+
     # Check if database exists
     is_first_startup = not db.db_exists()
 
@@ -97,13 +100,32 @@ async def startup_event():
     # Handle database initialization based on startup type
     if is_first_startup:
         print("🎉 First startup detected. Initializing database and configuration from setting.toml...")
-        config_dict = config.get_raw_config()
         await db.init_config_from_toml(config_dict, is_first_startup=True)
         print("✓ Database and configuration initialized successfully.")
     else:
         print("🔄 Existing database detected. Checking for missing tables and columns...")
-        await db.check_and_migrate_db()
+        await db.check_and_migrate_db(config_dict)
         print("✓ Database migration check completed.")
+
+    # Load admin credentials from database
+    admin_config = await db.get_admin_config()
+    config.set_admin_username_from_db(admin_config.admin_username)
+    config.set_admin_password_from_db(admin_config.admin_password)
+
+    # Load cache configuration from database
+    cache_config = await db.get_cache_config()
+    config.set_cache_enabled(cache_config.cache_enabled)
+    config.set_cache_timeout(cache_config.cache_timeout)
+    config.set_cache_base_url(cache_config.cache_base_url or "")
+
+    # Load generation configuration from database
+    generation_config = await db.get_generation_config()
+    config.set_image_timeout(generation_config.image_timeout)
+    config.set_video_timeout(generation_config.video_timeout)
+
+    # Load token refresh configuration from database
+    token_refresh_config = await db.get_token_refresh_config()
+    config.set_at_auto_refresh_enabled(token_refresh_config.at_auto_refresh_enabled)
 
     # Start file cache cleanup task
     await generation_handler.file_cache.start_cleanup_task()

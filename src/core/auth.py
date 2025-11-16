@@ -18,6 +18,7 @@ class AuthManager:
     @staticmethod
     def verify_admin(username: str, password: str) -> bool:
         """Verify admin credentials"""
+        # Compare with current config (which may be from database or config file)
         return username == config.admin_username and password == config.admin_password
     
     @staticmethod

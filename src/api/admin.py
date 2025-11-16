@@ -2,9 +2,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Header
 from typing import List, Optional
 from datetime import datetime
-from pathlib import Path
 import secrets
-import toml
 from pydantic import BaseModel
 from ..core.auth import AuthManager
 from ..core.config import config
@@ -342,10 +340,13 @@ async def update_admin_config(
 ):
     """Update admin configuration"""
     try:
-        admin_config = AdminConfig(
-            error_ban_threshold=request.error_ban_threshold
-        )
-        await db.update_admin_config(admin_config)
+        # Get current admin config to preserve username and password
+        current_config = await db.get_admin_config()
+
+        # Update only the error_ban_threshold, preserve username and password
+        current_config.error_ban_threshold = request.error_ban_threshold
+
+        await db.update_admin_config(current_config)
         return {"success": True, "message": "Configuration updated"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -361,30 +362,23 @@ async def update_admin_password(
         if not AuthManager.verify_admin(config.admin_username, request.old_password):
             raise HTTPException(status_code=400, detail="Old password is incorrect")
 
-        # Update password in config file
-        config_path = Path("config/setting.toml")
-        if not config_path.exists():
-            raise HTTPException(status_code=500, detail="Config file not found")
+        # Get current admin config from database
+        admin_config = await db.get_admin_config()
 
-        # Read current config
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = toml.load(f)
-
-        # Update password
-        config_data["global"]["admin_password"] = request.new_password
+        # Update password in database
+        admin_config.admin_password = request.new_password
 
         # Update username if provided
         if request.username:
-            config_data["global"]["admin_username"] = request.username
+            admin_config.admin_username = request.username
 
-        # Write back
-        with open(config_path, "w", encoding="utf-8") as f:
-            toml.dump(config_data, f)
+        # Update in database
+        await db.update_admin_config(admin_config)
 
         # Update in-memory config
-        config.admin_password = request.new_password
+        config.set_admin_password_from_db(request.new_password)
         if request.username:
-            config.admin_username = request.username
+            config.set_admin_username_from_db(request.username)
 
         # Invalidate all admin tokens (force re-login)
         active_admin_tokens.clear()
@@ -402,22 +396,6 @@ async def update_api_key(
 ):
     """Update API key"""
     try:
-        # Update API key in config file
-        config_path = Path("config/setting.toml")
-        if not config_path.exists():
-            raise HTTPException(status_code=500, detail="Config file not found")
-
-        # Read current config
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = toml.load(f)
-
-        # Update API key
-        config_data["global"]["api_key"] = request.new_api_key
-
-        # Write back
-        with open(config_path, "w", encoding="utf-8") as f:
-            toml.dump(config_data, f)
-
         # Update in-memory config
         config.api_key = request.new_api_key
 
@@ -432,31 +410,6 @@ async def update_debug_config(
 ):
     """Update debug configuration"""
     try:
-        # Update config file
-        config_path = Path("config/setting.toml")
-        if not config_path.exists():
-            raise HTTPException(status_code=500, detail="Config file not found")
-
-        # Read current config
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = toml.load(f)
-
-        # Ensure debug section exists
-        if "debug" not in config_data:
-            config_data["debug"] = {
-                "enabled": False,
-                "log_requests": True,
-                "log_responses": True,
-                "mask_token": True
-            }
-
-        # Update debug enabled
-        config_data["debug"]["enabled"] = request.enabled
-
-        # Write back
-        with open(config_path, "w", encoding="utf-8") as f:
-            toml.dump(config_data, f)
-
         # Update in-memory config
         config.set_debug_enabled(request.enabled)
 
@@ -636,24 +589,11 @@ async def update_cache_timeout(
         if request.timeout > 86400:
             raise HTTPException(status_code=400, detail="Cache timeout cannot exceed 24 hours (86400 seconds)")
 
-        # Update config file
-        config_path = Path("config/setting.toml")
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = toml.load(f)
-
-        if "cache" not in config_data:
-            config_data["cache"] = {}
-
-        config_data["cache"]["timeout"] = request.timeout
-
-        with open(config_path, "w", encoding="utf-8") as f:
-            toml.dump(config_data, f)
-
         # Update in-memory config
         config.set_cache_timeout(request.timeout)
 
-        # Reload config to ensure consistency
-        config.reload_config()
+        # Update database
+        await db.update_cache_config(timeout=request.timeout)
 
         # Update file cache timeout
         if generation_handler:
@@ -688,24 +628,11 @@ async def update_cache_base_url(
         if base_url:
             base_url = base_url.rstrip('/')
 
-        # Update config file
-        config_path = Path("config/setting.toml")
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = toml.load(f)
-
-        if "cache" not in config_data:
-            config_data["cache"] = {}
-
-        config_data["cache"]["base_url"] = base_url
-
-        with open(config_path, "w", encoding="utf-8") as f:
-            toml.dump(config_data, f)
-
         # Update in-memory config
         config.set_cache_base_url(base_url)
 
-        # Reload config to ensure consistency
-        config.reload_config()
+        # Update database
+        await db.update_cache_config(base_url=base_url)
 
         return {
             "success": True,
@@ -720,9 +647,6 @@ async def update_cache_base_url(
 @router.get("/api/cache/config")
 async def get_cache_config(token: str = Depends(verify_admin_token)):
     """Get cache configuration"""
-    # Reload config from file to get latest values
-    config.reload_config()
-
     return {
         "success": True,
         "config": {
@@ -742,24 +666,11 @@ async def update_cache_enabled(
     try:
         enabled = request.get("enabled", True)
 
-        # Update config file
-        config_path = Path("config/setting.toml")
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = toml.load(f)
-
-        if "cache" not in config_data:
-            config_data["cache"] = {}
-
-        config_data["cache"]["enabled"] = enabled
-
-        with open(config_path, "w", encoding="utf-8") as f:
-            toml.dump(config_data, f)
-
         # Update in-memory config
         config.set_cache_enabled(enabled)
 
-        # Reload config to ensure consistency
-        config.reload_config()
+        # Update database
+        await db.update_cache_config(enabled=enabled)
 
         return {
             "success": True,
@@ -773,9 +684,6 @@ async def update_cache_enabled(
 @router.get("/api/generation/timeout")
 async def get_generation_timeout(token: str = Depends(verify_admin_token)):
     """Get generation timeout configuration"""
-    # Reload config from file to get latest values
-    config.reload_config()
-
     return {
         "success": True,
         "config": {
@@ -804,31 +712,17 @@ async def update_generation_timeout(
             if request.video_timeout > 7200:
                 raise HTTPException(status_code=400, detail="Video timeout cannot exceed 2 hours (7200 seconds)")
 
-        # Update config file
-        config_path = Path("config/setting.toml")
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = toml.load(f)
-
-        if "generation" not in config_data:
-            config_data["generation"] = {}
-
-        if request.image_timeout is not None:
-            config_data["generation"]["image_timeout"] = request.image_timeout
-
-        if request.video_timeout is not None:
-            config_data["generation"]["video_timeout"] = request.video_timeout
-
-        with open(config_path, "w", encoding="utf-8") as f:
-            toml.dump(config_data, f)
-
         # Update in-memory config
         if request.image_timeout is not None:
             config.set_image_timeout(request.image_timeout)
         if request.video_timeout is not None:
             config.set_video_timeout(request.video_timeout)
 
-        # Reload config to ensure consistency
-        config.reload_config()
+        # Update database
+        await db.update_generation_config(
+            image_timeout=request.image_timeout,
+            video_timeout=request.video_timeout
+        )
 
         # Update TokenLock timeout if image timeout was changed
         if request.image_timeout is not None and generation_handler:
@@ -851,9 +745,6 @@ async def update_generation_timeout(
 @router.get("/api/token-refresh/config")
 async def get_at_auto_refresh_config(token: str = Depends(verify_admin_token)):
     """Get AT auto refresh configuration"""
-    # Reload config from file to get latest values
-    config.reload_config()
-
     return {
         "success": True,
         "config": {
@@ -870,24 +761,11 @@ async def update_at_auto_refresh_enabled(
     try:
         enabled = request.get("enabled", False)
 
-        # Update config file
-        config_path = Path("config/setting.toml")
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = toml.load(f)
-
-        if "token_refresh" not in config_data:
-            config_data["token_refresh"] = {}
-
-        config_data["token_refresh"]["at_auto_refresh_enabled"] = enabled
-
-        with open(config_path, "w", encoding="utf-8") as f:
-            toml.dump(config_data, f)
-
         # Update in-memory config
         config.set_at_auto_refresh_enabled(enabled)
 
-        # Reload config to ensure consistency
-        config.reload_config()
+        # Update database
+        await db.update_token_refresh_config(enabled)
 
         return {
             "success": True,
