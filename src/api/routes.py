@@ -156,7 +156,7 @@ async def create_chat_completion(
             if not request.stream:
                 # Non-streaming mode: only check availability
                 result = None
-                async for chunk in generation_handler.handle_generation(
+                async for chunk in generation_handler.handle_generation_with_retry(
                     model=request.model,
                     prompt=prompt,
                     image=image_data,
@@ -203,7 +203,7 @@ async def create_chat_completion(
         if request.stream:
             async def generate():
                 try:
-                    async for chunk in generation_handler.handle_generation(
+                    async for chunk in generation_handler.handle_generation_with_retry(
                         model=request.model,
                         prompt=prompt,
                         image=image_data,
@@ -250,7 +250,7 @@ async def create_chat_completion(
         else:
             # Non-streaming response (availability check only)
             result = None
-            async for chunk in generation_handler.handle_generation(
+            async for chunk in generation_handler.handle_generation_with_retry(
                 model=request.model,
                 prompt=prompt,
                 image=image_data,

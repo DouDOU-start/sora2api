@@ -66,6 +66,7 @@ class Task(BaseModel):
     progress: float = 0.0
     result_urls: Optional[str] = None  # JSON array
     error_message: Optional[str] = None
+    retry_count: int = 0  # 当前重试次数
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
@@ -89,6 +90,8 @@ class AdminConfig(BaseModel):
     admin_password: str  # Read from database, initialized from setting.toml on first startup
     api_key: str  # Read from database, initialized from setting.toml on first startup
     error_ban_threshold: int = 3
+    task_retry_enabled: bool = True  # 是否启用任务失败重试
+    task_max_retries: int = 3  # 任务最大重试次数
     updated_at: Optional[datetime] = None
 
 class ProxyConfig(BaseModel):

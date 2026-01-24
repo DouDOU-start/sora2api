@@ -117,6 +117,8 @@ class ImportTokensRequest(BaseModel):
 
 class UpdateAdminConfigRequest(BaseModel):
     error_ban_threshold: int
+    task_retry_enabled: Optional[bool] = None
+    task_max_retries: Optional[int] = None
 
 class UpdateProxyConfigRequest(BaseModel):
     proxy_enabled: bool
@@ -678,6 +680,8 @@ async def get_admin_config(token: str = Depends(verify_admin_token)) -> dict:
     admin_config = await db.get_admin_config()
     return {
         "error_ban_threshold": admin_config.error_ban_threshold,
+        "task_retry_enabled": admin_config.task_retry_enabled,
+        "task_max_retries": admin_config.task_max_retries,
         "api_key": config.api_key,
         "admin_username": config.admin_username,
         "debug_enabled": config.debug_enabled
@@ -693,8 +697,14 @@ async def update_admin_config(
         # Get current admin config to preserve username and password
         current_config = await db.get_admin_config()
 
-        # Update only the error_ban_threshold, preserve username and password
+        # Update error_ban_threshold
         current_config.error_ban_threshold = request.error_ban_threshold
+
+        # Update retry settings if provided
+        if request.task_retry_enabled is not None:
+            current_config.task_retry_enabled = request.task_retry_enabled
+        if request.task_max_retries is not None:
+            current_config.task_max_retries = request.task_max_retries
 
         await db.update_admin_config(current_config)
         return {"success": True, "message": "Configuration updated"}

@@ -242,6 +242,26 @@ class GenerationHandler:
             video_str = video_str.split(",", 1)[1]
         return base64.b64decode(video_str)
 
+    def _should_retry_on_error(self, error: Exception) -> bool:
+        """判断错误是否应该触发重试
+
+        Args:
+            error: 捕获的异常
+
+        Returns:
+            True if should retry, False otherwise
+        """
+        error_str = str(error).lower()
+
+        # 排除 CF Shield/429 错误（这些错误重试也会失败）
+        if "cf_shield" in error_str or "cloudflare" in error_str:
+            return False
+        if "429" in error_str or "rate limit" in error_str:
+            return False
+
+        # 其他所有错误都可以重试
+        return True
+
     def _process_character_username(self, username_hint: str) -> str:
         """Process character username from API response
 
@@ -707,7 +727,68 @@ class GenerationHandler:
                         duration=duration
                     )
             raise e
-    
+
+    async def handle_generation_with_retry(self, model: str, prompt: str,
+                                          image: Optional[str] = None,
+                                          video: Optional[str] = None,
+                                          remix_target_id: Optional[str] = None,
+                                          stream: bool = True) -> AsyncGenerator[str, None]:
+        """Handle generation request with automatic retry on failure
+
+        Args:
+            model: Model name
+            prompt: Generation prompt
+            image: Base64 encoded image
+            video: Base64 encoded video or video URL
+            remix_target_id: Sora share link video ID for remix
+            stream: Whether to stream response
+        """
+        # Get admin config for retry settings
+        admin_config = await self.db.get_admin_config()
+        retry_enabled = admin_config.task_retry_enabled
+        max_retries = admin_config.task_max_retries if retry_enabled else 0
+
+        retry_count = 0
+        last_error = None
+
+        while retry_count <= max_retries:
+            try:
+                # Try generation
+                async for chunk in self.handle_generation(model, prompt, image, video, remix_target_id, stream):
+                    yield chunk
+                # If successful, return
+                return
+
+            except Exception as e:
+                last_error = e
+
+                # Check if we should retry
+                should_retry = (
+                    retry_enabled and
+                    retry_count < max_retries and
+                    self._should_retry_on_error(e)
+                )
+
+                if should_retry:
+                    retry_count += 1
+                    debug_logger.log_info(f"Generation failed, retrying ({retry_count}/{max_retries}): {str(e)}")
+
+                    # Send retry notification to user if streaming
+                    if stream:
+                        yield self._format_stream_chunk(
+                            reasoning_content=f"**生成失败，正在重试**\\n\\n第 {retry_count} 次重试（共 {max_retries} 次）...\\n\\n失败原因：{str(e)}\\n\\n"
+                        )
+
+                    # Small delay before retry
+                    await asyncio.sleep(2)
+                else:
+                    # No more retries, raise the error
+                    raise last_error
+
+        # If we exhausted all retries, raise the last error
+        if last_error:
+            raise last_error
+
     async def _poll_task_result(self, task_id: str, token: str, is_video: bool,
                                 stream: bool, prompt: str, token_id: int = None,
                                 log_id: int = None, start_time: float = None) -> AsyncGenerator[str, None]:

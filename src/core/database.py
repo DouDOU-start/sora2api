@@ -55,6 +55,8 @@ class Database:
             admin_password = "admin"
             api_key = "han1234"
             error_ban_threshold = 3
+            task_retry_enabled = True
+            task_max_retries = 3
 
             if config_dict:
                 global_config = config_dict.get("global", {})
@@ -64,11 +66,13 @@ class Database:
 
                 admin_config = config_dict.get("admin", {})
                 error_ban_threshold = admin_config.get("error_ban_threshold", 3)
+                task_retry_enabled = admin_config.get("task_retry_enabled", True)
+                task_max_retries = admin_config.get("task_max_retries", 3)
 
             await db.execute("""
-                INSERT INTO admin_config (id, admin_username, admin_password, api_key, error_ban_threshold)
-                VALUES (1, ?, ?, ?, ?)
-            """, (admin_username, admin_password, api_key, error_ban_threshold))
+                INSERT INTO admin_config (id, admin_username, admin_password, api_key, error_ban_threshold, task_retry_enabled, task_max_retries)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
+            """, (admin_username, admin_password, api_key, error_ban_threshold, task_retry_enabled, task_max_retries))
 
         # Ensure proxy_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM proxy_config")
@@ -463,6 +467,16 @@ class Database:
                 await db.execute("ALTER TABLE token_stats ADD COLUMN today_error_count INTEGER DEFAULT 0")
             if not await self._column_exists(db, "token_stats", "today_date"):
                 await db.execute("ALTER TABLE token_stats ADD COLUMN today_date DATE")
+
+            # Migration: Add retry_count column to tasks table if it doesn't exist
+            if not await self._column_exists(db, "tasks", "retry_count"):
+                await db.execute("ALTER TABLE tasks ADD COLUMN retry_count INTEGER DEFAULT 0")
+
+            # Migration: Add task retry config columns to admin_config table if they don't exist
+            if not await self._column_exists(db, "admin_config", "task_retry_enabled"):
+                await db.execute("ALTER TABLE admin_config ADD COLUMN task_retry_enabled BOOLEAN DEFAULT 1")
+            if not await self._column_exists(db, "admin_config", "task_max_retries"):
+                await db.execute("ALTER TABLE admin_config ADD COLUMN task_max_retries INTEGER DEFAULT 3")
 
             await db.commit()
 
