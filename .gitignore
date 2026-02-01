@@ -29,8 +29,9 @@ env/
 *.db
 *.sqlite
 *.sqlite3
-data/*.db
-data/*.sqlite
+
+# Data directory (runtime data, databases, logs, etc.)
+data/
 
 # IDE
 .vscode/
