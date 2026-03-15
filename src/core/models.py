@@ -102,6 +102,8 @@ class ProxyConfig(BaseModel):
     id: int = 1
     proxy_enabled: bool  # Read from database, initialized from setting.toml on first startup
     proxy_url: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
+    image_upload_proxy_enabled: bool = False  # Image upload proxy enabled
+    image_upload_proxy_url: Optional[str] = None  # Image upload proxy URL
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -145,6 +147,7 @@ class CallLogicConfig(BaseModel):
     id: int = 1
     call_mode: str = "default"  # "default" or "polling"
     polling_mode_enabled: bool = False  # Read from database, initialized from setting.toml on first startup
+    poll_interval: float = 2.5  # Progress polling interval in seconds
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -160,6 +163,7 @@ class PowServiceConfig(BaseModel):
     """POW service configuration"""
     id: int = 1
     mode: str = "local"  # "local" or "external"
+    use_token_for_pow: bool = False  # Whether to use current token for POW calculation
     server_url: Optional[str] = None  # External POW service URL
     api_key: Optional[str] = None  # External POW service API key
     proxy_enabled: bool = False  # Whether to enable proxy for POW service

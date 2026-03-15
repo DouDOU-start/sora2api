@@ -63,6 +63,17 @@ MODEL_CONFIG = {
         "orientation": "portrait",
         "n_frames": 450
     },
+    # Video extension models (long_video_extension)
+    "sora2-extension-10s": {
+        "type": "video",
+        "mode": "video_extension",
+        "extension_duration_s": 10
+    },
+    "sora2-extension-15s": {
+        "type": "video",
+        "mode": "video_extension",
+        "extension_duration_s": 15
+    },
     # Video models with 25s duration (750 frames) - require Pro subscription
     "sora2-landscape-25s": {
         "type": "video",
@@ -207,6 +218,12 @@ MODEL_CONFIG = {
         "type": "prompt_enhance",
         "expansion_level": "long",
         "duration_s": 20
+    },
+    # Avatar creation model (character creation only)
+    "avatar-create": {
+        "type": "avatar_create",
+        "orientation": "portrait",
+        "n_frames": 300
     }
 }
 
@@ -265,6 +282,13 @@ class GenerationHandler:
             return False
         if "429" in error_str or "rate limit" in error_str:
             return False
+        # 参数/模型使用错误无需重试
+        if "invalid model" in error_str:
+            return False
+        if "avatar-create" in error_str:
+            return False
+        if "参数错误" in error_str:
+            return False
 
         # 其他所有错误都可以重试
         return True
@@ -298,6 +322,29 @@ class GenerationHandler:
         debug_logger.log_info(f"Processed username: {username_hint} -> {final_username}")
 
         return final_username
+
+    def _extract_generation_id(self, text: str) -> str:
+        """Extract generation ID from text.
+
+        Supported format: gen_[a-zA-Z0-9]+
+        """
+        if not text:
+            return ""
+
+        match = re.search(r'gen_[a-zA-Z0-9]+', text)
+        if match:
+            return match.group(0)
+
+        return ""
+
+    def _clean_generation_id_from_prompt(self, prompt: str) -> str:
+        """Remove generation_id (gen_xxx) from prompt."""
+        if not prompt:
+            return ""
+
+        cleaned = re.sub(r'gen_[a-zA-Z0-9]+', '', prompt)
+        cleaned = ' '.join(cleaned.split())
+        return cleaned
 
     def _clean_remix_link_from_prompt(self, prompt: str) -> str:
         """Remove remix link from prompt
@@ -429,9 +476,10 @@ class GenerationHandler:
             raise ValueError(f"Invalid model: {model}")
 
         model_config = MODEL_CONFIG[model]
-        is_video = model_config["type"] == "video"
+        is_video = model_config["type"] in ["video", "avatar_create"]
         is_image = model_config["type"] == "image"
         is_prompt_enhance = model_config["type"] == "prompt_enhance"
+        is_avatar_create = model_config["type"] == "avatar_create"
 
         # Handle prompt enhancement
         if is_prompt_enhance:
@@ -445,40 +493,56 @@ class GenerationHandler:
             if available:
                 if is_image:
                     message = "All tokens available for image generation. Please enable streaming to use the generation feature."
+                elif is_avatar_create:
+                    message = "All tokens available for avatar creation. Please enable streaming to create avatar."
                 else:
                     message = "All tokens available for video generation. Please enable streaming to use the generation feature."
             else:
                 if is_image:
                     message = "No available models for image generation"
+                elif is_avatar_create:
+                    message = "No available tokens for avatar creation"
                 else:
                     message = "No available models for video generation"
 
             yield self._format_non_stream_response(message, is_availability_check=True)
             return
 
-        # Handle character creation and remix flows for video models
-        if is_video:
+        # Handle avatar creation model (character creation only)
+        if is_avatar_create:
+            # Priority: video > prompt内generation_id(gen_xxx)
+            if video:
+                video_data = self._decode_base64_video(video) if video.startswith("data:") or not video.startswith("http") else video
+                async for chunk in self._handle_character_creation_only(video_data, model_config):
+                    yield chunk
+                return
+
+            # generation_id 仅从提示词解析
+            source_generation_id = self._extract_generation_id(prompt) if prompt else None
+            if source_generation_id:
+                async for chunk in self._handle_character_creation_from_generation_id(source_generation_id, model_config):
+                    yield chunk
+                return
+
+            raise Exception("avatar-create 模型需要传入视频文件，或在提示词中包含 generation_id（gen_xxx）。")
+
+        # Handle remix flow for regular video models
+        if model_config["type"] == "video":
             # Remix flow: remix_target_id provided
             if remix_target_id:
                 async for chunk in self._handle_remix(remix_target_id, prompt, model_config):
                     yield chunk
                 return
 
-            # Character creation flow: video provided
+            # Character creation has been isolated into avatar-create model
             if video:
-                # Decode video if it's base64
-                video_data = self._decode_base64_video(video) if video.startswith("data:") or not video.startswith("http") else video
+                raise Exception("角色创建已独立为 avatar-create 模型，请切换模型后重试。")
 
-                # If no prompt, just create character and return
-                if not prompt:
-                    async for chunk in self._handle_character_creation_only(video_data, model_config):
-                        yield chunk
-                    return
-                else:
-                    # If prompt provided, create character and generate video
-                    async for chunk in self._handle_character_and_video_generation(video_data, prompt, model_config):
-                        yield chunk
-                    return
+        # Handle video extension flow
+        if model_config.get("mode") == "video_extension":
+            async for chunk in self._handle_video_extension(prompt, model_config, model):
+                yield chunk
+            return
 
         # Streaming mode: proceed with actual generation
         # Check if model requires Pro subscription
@@ -547,7 +611,11 @@ class GenerationHandler:
                     is_first_chunk = False
 
                 image_data = self._decode_base64_image(image)
-                media_id = await self.sora_client.upload_image(image_data, token_obj.token)
+                media_id = await self.sora_client.upload_image(
+                    image_data,
+                    token_obj.token,
+                    token_id=token_obj.id
+                )
 
                 if stream:
                     yield self._format_stream_chunk(
@@ -797,7 +865,15 @@ class GenerationHandler:
                 # Try generation
                 # Only show init message on first attempt (not on retries)
                 show_init = (retry_count == 0)
-                async for chunk in self.handle_generation(model, prompt, image, video, remix_target_id, stream, show_init_message=show_init):
+                async for chunk in self.handle_generation(
+                    model,
+                    prompt,
+                    image,
+                    video,
+                    remix_target_id,
+                    stream,
+                    show_init_message=show_init
+                ):
                     yield chunk
                 # If successful, return
                 return
@@ -950,7 +1026,7 @@ class GenerationHandler:
                                 last_status_output_time = current_time
                                 debug_logger.log_info(f"Task {task_id} progress: {progress_pct}% (status: {status})")
                                 yield self._format_stream_chunk(
-                                    reasoning_content=f"**Video Generation Progress**: {progress_pct}% ({status})\n"
+                                    reasoning_content=f"\n**Video Generation Progress**: {progress_pct}% ({status})\n"
                                 )
                             break
 
@@ -1640,7 +1716,11 @@ class GenerationHandler:
             yield self._format_stream_chunk(
                 reasoning_content="Uploading character avatar...\n"
             )
-            asset_pointer = await self.sora_client.upload_character_image(avatar_data, token_obj.token)
+            asset_pointer = await self.sora_client.upload_character_image(
+                avatar_data,
+                token_obj.token,
+                token_id=token_obj.id
+            )
             debug_logger.log_info(f"Avatar uploaded, asset_pointer: {asset_pointer}")
 
             # Step 5: Finalize character
@@ -1669,6 +1749,17 @@ class GenerationHandler:
 
             # Log successful character creation
             duration = time.time() - start_time
+            character_card = {
+                "username": username,
+                "display_name": display_name,
+                "character_id": character_id,
+                "cameo_id": cameo_id,
+                "profile_asset_url": profile_asset_url,
+                "instruction_set": instruction_set,
+                "public": True,
+                "source_model": "avatar-create",
+                "created_at": int(datetime.now().timestamp())
+            }
             await self._log_request(
                 token_id=token_obj.id,
                 operation="character_only",
@@ -1678,18 +1769,31 @@ class GenerationHandler:
                 },
                 response_data={
                     "success": True,
-                    "username": username,
-                    "display_name": display_name,
-                    "character_id": character_id,
-                    "cameo_id": cameo_id
+                    "card": character_card
                 },
                 status_code=200,
                 duration=duration
             )
 
-            # Step 7: Return success message
+            # Step 7: Return structured character card
             yield self._format_stream_chunk(
-                content=f"角色创建成功，角色名@{username}",
+                content=(
+                    json.dumps({
+                        "event": "character_card",
+                        "card": character_card
+                    }, ensure_ascii=False)
+                    + "\n"
+                )
+            )
+
+            # Step 8: Return summary message
+            yield self._format_stream_chunk(
+                content=(
+                    f"角色创建成功，角色名@{username}\n"
+                    f"显示名：{display_name}\n"
+                    f"Character ID：{character_id}\n"
+                    f"Cameo ID：{cameo_id}"
+                ),
                 finish_reason="STOP"
             )
             yield "data: [DONE]\n\n"
@@ -1736,6 +1840,189 @@ class GenerationHandler:
 
             debug_logger.log_error(
                 error_message=f"Character creation failed: {str(e)}",
+                status_code=429 if is_cf_or_429 else 500,
+                response_text=str(e)
+            )
+            raise
+
+    async def _handle_character_creation_from_generation_id(self, generation_id: str, model_config: Dict) -> AsyncGenerator[str, None]:
+        """Handle character creation from generation id (gen_xxx)."""
+        token_obj = await self.load_balancer.select_token(for_video_generation=True)
+        if not token_obj:
+            raise Exception("No available tokens for character creation")
+
+        start_time = time.time()
+        normalized_generation_id = self._extract_generation_id((generation_id or "").strip())
+        try:
+            yield self._format_stream_chunk(
+                reasoning_content="**Character Creation Begins**\n\nInitializing character creation from generation id...\n",
+                is_first=True
+            )
+
+            if not normalized_generation_id:
+                raise Exception("无效 generation_id，请传入 gen_xxx。")
+
+            # Step 1: Create cameo from generation
+            yield self._format_stream_chunk(
+                reasoning_content=f"Creating character from generation: {normalized_generation_id} ...\n"
+            )
+            cameo_id = await self.sora_client.create_character_from_generation(
+                generation_id=normalized_generation_id,
+                token=token_obj.token,
+                timestamps=[0, 3]
+            )
+            debug_logger.log_info(f"Character-from-generation submitted, cameo_id: {cameo_id}")
+
+            # Step 2: Poll cameo processing
+            yield self._format_stream_chunk(
+                reasoning_content="Processing generation to extract character...\n"
+            )
+            cameo_status = await self._poll_cameo_status(cameo_id, token_obj.token)
+            debug_logger.log_info(f"Cameo status: {cameo_status}")
+
+            # Extract character info
+            username_hint = cameo_status.get("username_hint", "character")
+            display_name = cameo_status.get("display_name_hint", "Character")
+            username = self._process_character_username(username_hint)
+
+            yield self._format_stream_chunk(
+                reasoning_content=f"✨ 角色已识别: {display_name} (@{username})\n"
+            )
+
+            # Step 3: Download avatar
+            yield self._format_stream_chunk(
+                reasoning_content="Downloading character avatar...\n"
+            )
+            profile_asset_url = cameo_status.get("profile_asset_url")
+            if not profile_asset_url:
+                raise Exception("Profile asset URL not found in cameo status")
+
+            avatar_data = await self.sora_client.download_character_image(profile_asset_url)
+            debug_logger.log_info(f"Avatar downloaded, size: {len(avatar_data)} bytes")
+
+            # Step 4: Upload avatar
+            yield self._format_stream_chunk(
+                reasoning_content="Uploading character avatar...\n"
+            )
+            asset_pointer = await self.sora_client.upload_character_image(
+                avatar_data,
+                token_obj.token,
+                token_id=token_obj.id
+            )
+            debug_logger.log_info(f"Avatar uploaded, asset_pointer: {asset_pointer}")
+
+            # Step 5: Finalize character
+            yield self._format_stream_chunk(
+                reasoning_content="Finalizing character creation...\n"
+            )
+            instruction_set = cameo_status.get("instruction_set_hint") or cameo_status.get("instruction_set")
+            character_id = await self.sora_client.finalize_character(
+                cameo_id=cameo_id,
+                username=username,
+                display_name=display_name,
+                profile_asset_pointer=asset_pointer,
+                instruction_set=instruction_set,
+                token=token_obj.token
+            )
+            debug_logger.log_info(f"Character finalized, character_id: {character_id}")
+
+            # Step 6: Set public
+            yield self._format_stream_chunk(
+                reasoning_content="Setting character as public...\n"
+            )
+            await self.sora_client.set_character_public(cameo_id, token_obj.token)
+            debug_logger.log_info("Character set as public")
+
+            # Log success
+            duration = time.time() - start_time
+            character_card = {
+                "username": username,
+                "display_name": display_name,
+                "character_id": character_id,
+                "cameo_id": cameo_id,
+                "profile_asset_url": profile_asset_url,
+                "instruction_set": instruction_set,
+                "public": True,
+                "source_model": "avatar-create",
+                "source_generation_id": normalized_generation_id,
+                "created_at": int(datetime.now().timestamp())
+            }
+            await self._log_request(
+                token_id=token_obj.id,
+                operation="character_only",
+                request_data={
+                    "type": "character_creation",
+                    "has_video": False,
+                    "has_generation_id": True,
+                    "generation_id": normalized_generation_id
+                },
+                response_data={
+                    "success": True,
+                    "card": character_card
+                },
+                status_code=200,
+                duration=duration
+            )
+
+            yield self._format_stream_chunk(
+                content=(
+                    json.dumps({
+                        "event": "character_card",
+                        "card": character_card
+                    }, ensure_ascii=False)
+                    + "\n"
+                )
+            )
+            yield self._format_stream_chunk(
+                content=(
+                    f"角色创建成功，角色名@{username}\n"
+                    f"显示名：{display_name}\n"
+                    f"Character ID：{character_id}\n"
+                    f"Cameo ID：{cameo_id}"
+                ),
+                finish_reason="STOP"
+            )
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            error_response = None
+            try:
+                error_response = json.loads(str(e))
+            except:
+                pass
+
+            is_cf_or_429 = False
+            if error_response and isinstance(error_response, dict):
+                error_info = error_response.get("error", {})
+                if error_info.get("code") == "cf_shield_429":
+                    is_cf_or_429 = True
+
+            duration = time.time() - start_time
+            await self._log_request(
+                token_id=token_obj.id if token_obj else None,
+                operation="character_only",
+                request_data={
+                    "type": "character_creation",
+                    "has_video": False,
+                    "has_generation_id": bool(normalized_generation_id),
+                    "generation_id": normalized_generation_id
+                },
+                response_data={
+                    "success": False,
+                    "error": str(e)
+                },
+                status_code=429 if is_cf_or_429 else 500,
+                duration=duration
+            )
+
+            if token_obj:
+                error_str = str(e).lower()
+                is_overload = "heavy_load" in error_str or "under heavy load" in error_str
+                if not is_cf_or_429:
+                    await self.token_manager.record_error(token_obj.id, is_overload=is_overload)
+
+            debug_logger.log_error(
+                error_message=f"Character creation from generation id failed: {str(e)}",
                 status_code=429 if is_cf_or_429 else 500,
                 response_text=str(e)
             )
@@ -1821,7 +2108,11 @@ class GenerationHandler:
             yield self._format_stream_chunk(
                 reasoning_content="Uploading character avatar...\n"
             )
-            asset_pointer = await self.sora_client.upload_character_image(avatar_data, token_obj.token)
+            asset_pointer = await self.sora_client.upload_character_image(
+                avatar_data,
+                token_obj.token,
+                token_id=token_obj.id
+            )
             debug_logger.log_info(f"Avatar uploaded, asset_pointer: {asset_pointer}")
 
             # Step 5: Finalize character
@@ -2069,6 +2360,169 @@ class GenerationHandler:
                 response_text=str(e)
             )
             raise
+
+    async def _handle_video_extension(self, prompt: str, model_config: Dict, model_name: str) -> AsyncGenerator[str, None]:
+        """Handle long video extension generation."""
+        token_obj = await self.load_balancer.select_token(for_video_generation=True)
+        if not token_obj:
+            raise Exception("No available tokens for video extension generation")
+
+        task_id = None
+        start_time = time.time()
+        log_id = None
+        log_updated = False
+        try:
+            # Create initial request log entry (in-progress)
+            log_id = await self._log_request(
+                token_obj.id,
+                "video_extension",
+                {"model": model_name, "prompt": prompt},
+                {},
+                -1,
+                -1.0,
+                task_id=None
+            )
+
+            yield self._format_stream_chunk(
+                reasoning_content="**Video Extension Process Begins**\n\nInitializing extension request...\n",
+                is_first=True
+            )
+
+            generation_id = self._extract_generation_id(prompt or "")
+            if not generation_id:
+                raise Exception("视频续写模型需要在提示词中包含 generation_id（gen_xxx）。示例：gen_xxx 流星雨")
+
+            clean_prompt = self._clean_generation_id_from_prompt(prompt or "")
+            if not clean_prompt:
+                raise Exception("视频续写模型需要提供续写提示词。示例：gen_xxx 流星雨")
+
+            extension_duration_s = model_config.get("extension_duration_s", 10)
+            if extension_duration_s not in [10, 15]:
+                raise Exception("extension_duration_s 仅支持 10 或 15")
+
+            yield self._format_stream_chunk(
+                reasoning_content=(
+                    f"Submitting extension task...\n"
+                    f"- generation_id: {generation_id}\n"
+                    f"- extension_duration_s: {extension_duration_s}\n\n"
+                )
+            )
+
+            task_id = await self.sora_client.extend_video(
+                generation_id=generation_id,
+                prompt=clean_prompt,
+                extension_duration_s=extension_duration_s,
+                token=token_obj.token,
+                token_id=token_obj.id
+            )
+            debug_logger.log_info(f"Video extension started, task_id: {task_id}")
+
+            task = Task(
+                task_id=task_id,
+                token_id=token_obj.id,
+                model=model_name,
+                prompt=f"extend:{generation_id} {clean_prompt}",
+                status="processing",
+                progress=0.0
+            )
+            await self.db.create_task(task)
+            if log_id:
+                await self.db.update_request_log_task_id(log_id, task_id)
+
+            await self.token_manager.record_usage(token_obj.id, is_video=True)
+
+            async for chunk in self._poll_task_result(task_id, token_obj.token, True, True, clean_prompt, token_obj.id):
+                yield chunk
+
+            await self.token_manager.record_success(token_obj.id, is_video=True)
+
+            # Update request log on success
+            if log_id:
+                duration = time.time() - start_time
+                task_info = await self.db.get_task(task_id)
+                response_data = {
+                    "task_id": task_id,
+                    "status": "success",
+                    "model": model_name,
+                    "prompt": clean_prompt,
+                    "generation_id": generation_id,
+                    "extension_duration_s": extension_duration_s
+                }
+                if task_info and task_info.result_urls:
+                    try:
+                        response_data["result_urls"] = json.loads(task_info.result_urls)
+                    except:
+                        response_data["result_urls"] = task_info.result_urls
+
+                await self.db.update_request_log(
+                    log_id,
+                    response_body=json.dumps(response_data),
+                    status_code=200,
+                    duration=duration
+                )
+                log_updated = True
+
+        except Exception as e:
+            error_response = None
+            try:
+                error_response = json.loads(str(e))
+            except:
+                pass
+
+            is_cf_or_429 = False
+            if error_response and isinstance(error_response, dict):
+                error_info = error_response.get("error", {})
+                if error_info.get("code") == "cf_shield_429":
+                    is_cf_or_429 = True
+
+            if token_obj:
+                error_str = str(e).lower()
+                is_overload = "heavy_load" in error_str or "under heavy load" in error_str
+                if not is_cf_or_429:
+                    await self.token_manager.record_error(token_obj.id, is_overload=is_overload)
+
+            # Update request log on error
+            if log_id:
+                duration = time.time() - start_time
+                if error_response:
+                    await self.db.update_request_log(
+                        log_id,
+                        response_body=json.dumps(error_response),
+                        status_code=429 if is_cf_or_429 else 400,
+                        duration=duration
+                    )
+                else:
+                    await self.db.update_request_log(
+                        log_id,
+                        response_body=json.dumps({"error": str(e)}),
+                        status_code=500,
+                        duration=duration
+                    )
+                log_updated = True
+
+            debug_logger.log_error(
+                error_message=f"Video extension failed: {str(e)}",
+                status_code=429 if is_cf_or_429 else 500,
+                response_text=str(e)
+            )
+            raise
+        finally:
+            # Ensure log is not stuck at in-progress
+            if log_id and not log_updated:
+                try:
+                    duration = time.time() - start_time
+                    await self.db.update_request_log(
+                        log_id,
+                        response_body=json.dumps({"error": "Task failed or interrupted during processing"}),
+                        status_code=500,
+                        duration=duration
+                    )
+                except Exception as finally_error:
+                    debug_logger.log_error(
+                        error_message=f"Failed to update video extension log in finally block: {str(finally_error)}",
+                        status_code=500,
+                        response_text=str(finally_error)
+                    )
 
     async def _poll_cameo_status(self, cameo_id: str, token: str, timeout: int = 600, poll_interval: int = 5) -> Dict[str, Any]:
         """Poll for cameo (character) processing status

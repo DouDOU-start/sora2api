@@ -1,26 +1,44 @@
-"""POW Service Client - External POW service integration"""
-import json
-from typing import Optional, Tuple
+"""POW Service Client - External POW service integration (POST /api/v1/sora/sentinel-token)"""
+from typing import NamedTuple, Optional
 from curl_cffi.requests import AsyncSession
 
 from ..core.config import config
 from ..core.logger import debug_logger
 
 
-class POWServiceClient:
-    """Client for external POW service API"""
+class SentinelResult(NamedTuple):
+    """Result from external sentinel-token API."""
 
-    async def get_sentinel_token(self) -> Optional[Tuple[str, str, str]]:
-        """Get sentinel token from external POW service
+    sentinel_token: str
+    device_id: Optional[str]
+    user_agent: Optional[str]
+    cookie_header: Optional[str]
+
+
+class POWServiceClient:
+    """Client for external POW service API."""
+
+    async def get_sentinel_token(
+        self,
+        access_token: Optional[str] = None,
+        session_token: Optional[str] = None,
+        proxy_url: Optional[str] = None,
+        device_type: str = "ios",
+    ) -> Optional[SentinelResult]:
+        """Get sentinel token from external POW service.
+
+        Args:
+            access_token: Sora access token (optional).
+            session_token: Sora session token (optional).
+            proxy_url: Proxy URL for upstream solver (optional).
+            device_type: Device type hint for upstream solver.
 
         Returns:
-            Tuple of (sentinel_token, device_id, user_agent) or None on failure
+            SentinelResult or None on failure.
         """
-        # Read configuration dynamically on each call
         server_url = config.pow_service_server_url
         api_key = config.pow_service_api_key
-        proxy_enabled = config.pow_service_proxy_enabled
-        proxy_url = config.pow_service_proxy_url if proxy_enabled else None
+        request_proxy = config.pow_service_proxy_url if config.pow_service_proxy_enabled else None
 
         if not server_url or not api_key:
             debug_logger.log_error(
@@ -31,50 +49,57 @@ class POWServiceClient:
             )
             return None
 
-        # Construct API endpoint
-        api_url = f"{server_url.rstrip('/')}/api/pow/token"
+        api_url = f"{server_url.rstrip('/')}/api/v1/sora/sentinel-token"
 
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "Content-Type": "application/json",
         }
 
-        try:
-            debug_logger.log_info(f"[POW Service] Requesting token from {api_url}")
+        payload = {"device_type": device_type}
+        if access_token:
+            payload["access_token"] = access_token
+        if session_token:
+            payload["session_token"] = session_token
+        if proxy_url:
+            payload["proxy_url"] = proxy_url
 
+        def _mask(token_value: Optional[str]) -> str:
+            if not token_value:
+                return "none"
+            if len(token_value) <= 10:
+                return "***"
+            return f"{token_value[:6]}...{token_value[-4:]}"
+
+        debug_logger.log_info(
+            f"[POW Service] POST {api_url} access_token={_mask(access_token)} proxy_url={proxy_url or 'none'}"
+        )
+
+        try:
             async with AsyncSession(impersonate="chrome131") as session:
-                response = await session.get(
+                response = await session.post(
                     api_url,
                     headers=headers,
-                    proxy=proxy_url,
-                    timeout=30
+                    json=payload,
+                    proxy=request_proxy,
+                    timeout=30,
                 )
 
                 if response.status_code != 200:
-                    error_msg = f"POW service request failed: {response.status_code}"
                     debug_logger.log_error(
-                        error_message=error_msg,
+                        error_message=f"POW service request failed: {response.status_code}",
                         status_code=response.status_code,
                         response_text=response.text,
-                        source="POWServiceClient"
+                        source="POWServiceClient",
                     )
                     return None
 
                 data = response.json()
-
-                if not data.get("success"):
-                    debug_logger.log_error(
-                        error_message="POW service returned success=false",
-                        status_code=response.status_code,
-                        response_text=response.text,
-                        source="POWServiceClient"
-                    )
-                    return None
-
-                token = data.get("token")
+                token = data.get("sentinel_token")
                 device_id = data.get("device_id")
                 user_agent = data.get("user_agent")
-                cached = data.get("cached", False)
+                cookie_header = data.get("cookie_header")
 
                 if not token:
                     debug_logger.log_error(
@@ -85,42 +110,16 @@ class POWServiceClient:
                     )
                     return None
 
-                # Parse token to extract device_id if not provided
-                token_data = None
-                if not device_id:
-                    try:
-                        token_data = json.loads(token)
-                        device_id = token_data.get("id")
-                    except:
-                        pass
-
-                # 记录详细的 token 信息
-                cache_status = "cached" if cached else "fresh"
-                debug_logger.log_info("=" * 100)
-                debug_logger.log_info(f"[POW Service] Token obtained successfully ({cache_status})")
-                debug_logger.log_info(f"[POW Service] Token length: {len(token)}")
-                debug_logger.log_info(f"[POW Service] Device ID: {device_id}")
-                debug_logger.log_info(f"[POW Service] User Agent: {user_agent}")
-
-                # 解析并显示 token 结构
-                if not token_data:
-                    try:
-                        token_data = json.loads(token)
-                    except:
-                        debug_logger.log_info(f"[POW Service] Token is not valid JSON")
-                        token_data = None
-
-                if token_data:
-                    debug_logger.log_info(f"[POW Service] Token structure keys: {list(token_data.keys())}")
-                    for key, value in token_data.items():
-                        if isinstance(value, str) and len(value) > 100:
-                            debug_logger.log_info(f"[POW Service] Token[{key}]: <string, length={len(value)}>")
-                        else:
-                            debug_logger.log_info(f"[POW Service] Token[{key}]: {value}")
-
-                debug_logger.log_info("=" * 100)
-
-                return token, device_id, user_agent
+                debug_logger.log_info(
+                    f"[POW Service] sentinel_token len={len(token)} device_id={device_id} "
+                    f"ua={bool(user_agent)} cookie_header={bool(cookie_header)}"
+                )
+                return SentinelResult(
+                    sentinel_token=token,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    cookie_header=cookie_header,
+                )
 
         except Exception as e:
             debug_logger.log_error(
@@ -132,5 +131,4 @@ class POWServiceClient:
             return None
 
 
-# Global instance
 pow_service_client = POWServiceClient()

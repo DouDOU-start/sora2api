@@ -129,8 +129,10 @@ class UpdateAdminConfigRequest(BaseModel):
     auto_disable_on_401: Optional[bool] = None
 
 class UpdateProxyConfigRequest(BaseModel):
-    proxy_enabled: bool
+    proxy_enabled: Optional[bool] = None
     proxy_url: Optional[str] = None
+    image_upload_proxy_enabled: Optional[bool] = None
+    image_upload_proxy_url: Optional[str] = None
 
 class TestProxyRequest(BaseModel):
     test_url: Optional[str] = "https://sora.chatgpt.com"
@@ -166,6 +168,7 @@ class UpdateWatermarkFreeConfigRequest(BaseModel):
 class UpdateCallLogicConfigRequest(BaseModel):
     call_mode: Optional[str] = None  # "default" or "polling"
     polling_mode_enabled: Optional[bool] = None  # Legacy support
+    poll_interval: Optional[float] = None  # Progress polling interval (seconds)
 
 class UpdatePowProxyConfigRequest(BaseModel):
     pow_proxy_enabled: bool
@@ -173,6 +176,7 @@ class UpdatePowProxyConfigRequest(BaseModel):
 
 class UpdatePowServiceConfigRequest(BaseModel):
     mode: str  # "local" or "external"
+    use_token_for_pow: Optional[bool] = False
     server_url: Optional[str] = None
     api_key: Optional[str] = None
     proxy_enabled: Optional[bool] = None
@@ -942,7 +946,9 @@ async def get_proxy_config(token: str = Depends(verify_admin_token)) -> dict:
     config = await proxy_manager.get_proxy_config()
     return {
         "proxy_enabled": config.proxy_enabled,
-        "proxy_url": config.proxy_url
+        "proxy_url": config.proxy_url,
+        "image_upload_proxy_enabled": config.image_upload_proxy_enabled,
+        "image_upload_proxy_url": config.image_upload_proxy_url
     }
 
 @router.post("/api/proxy/config")
@@ -952,7 +958,26 @@ async def update_proxy_config(
 ):
     """Update proxy configuration"""
     try:
-        await proxy_manager.update_proxy_config(request.proxy_enabled, request.proxy_url)
+        current_config = await proxy_manager.get_proxy_config()
+        proxy_enabled = current_config.proxy_enabled if request.proxy_enabled is None else request.proxy_enabled
+        proxy_url = current_config.proxy_url if request.proxy_url is None else request.proxy_url
+        image_upload_proxy_enabled = (
+            current_config.image_upload_proxy_enabled
+            if request.image_upload_proxy_enabled is None
+            else request.image_upload_proxy_enabled
+        )
+        image_upload_proxy_url = (
+            current_config.image_upload_proxy_url
+            if request.image_upload_proxy_url is None
+            else request.image_upload_proxy_url
+        )
+
+        await proxy_manager.update_proxy_config(
+            proxy_enabled,
+            proxy_url,
+            image_upload_proxy_enabled,
+            image_upload_proxy_url
+        )
         return {"success": True, "message": "Proxy configuration updated"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1349,11 +1374,19 @@ async def get_call_logic_config(token: str = Depends(verify_admin_token)) -> dic
     call_mode = getattr(config_obj, "call_mode", None)
     if call_mode not in ("default", "polling"):
         call_mode = "polling" if config_obj.polling_mode_enabled else "default"
+    poll_interval = getattr(config_obj, "poll_interval", 2.5)
+    try:
+        poll_interval = float(poll_interval)
+    except (TypeError, ValueError):
+        poll_interval = 2.5
+    if poll_interval <= 0:
+        poll_interval = 2.5
     return {
         "success": True,
         "config": {
             "call_mode": call_mode,
-            "polling_mode_enabled": call_mode == "polling"
+            "polling_mode_enabled": call_mode == "polling",
+            "poll_interval": poll_interval
         }
     }
 
@@ -1370,13 +1403,26 @@ async def update_call_logic_config(
         if call_mode is None:
             raise HTTPException(status_code=400, detail="Invalid call_mode")
 
-        await db.update_call_logic_config(call_mode)
+        poll_interval = request.poll_interval
+        if poll_interval is not None:
+            try:
+                poll_interval = float(poll_interval)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="poll_interval must be a valid number")
+            if poll_interval <= 0:
+                raise HTTPException(status_code=400, detail="poll_interval must be greater than 0")
+
+        await db.update_call_logic_config(call_mode, poll_interval)
         config.set_call_logic_mode(call_mode)
+        if poll_interval is not None:
+            config.set_poll_interval(poll_interval)
+
         return {
             "success": True,
             "message": "Call logic configuration updated",
             "call_mode": call_mode,
-            "polling_mode_enabled": call_mode == "polling"
+            "polling_mode_enabled": call_mode == "polling",
+            "poll_interval": config.poll_interval
         }
     except HTTPException:
         raise
@@ -1408,6 +1454,7 @@ async def update_pow_proxy_config(
         config_obj = await db.get_pow_service_config()
         await db.update_pow_service_config(
             mode=config_obj.mode,
+            use_token_for_pow=config_obj.use_token_for_pow,
             server_url=config_obj.server_url,
             api_key=config_obj.api_key,
             proxy_enabled=request.pow_proxy_enabled,
@@ -1432,6 +1479,7 @@ async def get_pow_service_config(token: str = Depends(verify_admin_token)) -> di
         "success": True,
         "config": {
             "mode": config_obj.mode,
+            "use_token_for_pow": config_obj.use_token_for_pow,
             "server_url": config_obj.server_url or "",
             "api_key": config_obj.api_key or "",
             "proxy_enabled": config_obj.proxy_enabled,
@@ -1448,6 +1496,7 @@ async def update_pow_service_config(
     try:
         await db.update_pow_service_config(
             mode=request.mode,
+            use_token_for_pow=request.use_token_for_pow or False,
             server_url=request.server_url,
             api_key=request.api_key,
             proxy_enabled=request.proxy_enabled,
@@ -1455,6 +1504,7 @@ async def update_pow_service_config(
         )
         # Update runtime config
         config.set_pow_service_mode(request.mode)
+        config.set_pow_service_use_token_for_pow(request.use_token_for_pow or False)
         config.set_pow_service_server_url(request.server_url or "")
         config.set_pow_service_api_key(request.api_key or "")
         config.set_pow_service_proxy_enabled(request.proxy_enabled or False)
